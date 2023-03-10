@@ -1,0 +1,474 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  EnvironmentId:
+    Type: String
+    Description: 'Identificador del ambiente.'
+  EventBridgeEnabled:
+    Type: String
+    Description: "Permite activar o desactivar la regla de event bridge."
+  Module:
+    Description: Module
+    Type: String
+  AwsRegion:
+    Type: String
+    AllowedValues: [us-east-2, us-west-2, us-east-1]
+    ConstraintDescription: must specify us-east-2,us-west-2,us-east-1.
+    Description: Región en la cual se realizará el despliegue del microservicio.
+  AwsAccountId:
+    Type: String
+    Description: Identificador de la cuenta AWS donde se desplegará el microservicio.    
+  LambdaAliasBeta:
+    Type: String
+    Description: Environment alias
+    Default: "beta"
+
+  AchRtpRetriesLambdaConfiguration:
+    Description: "AchRtpRetriesLambdaConfiguration."
+    Type: String
+    Default: "2048:0:0:0:0:0.7:INFO"
+  AchRtpDeadLetterLambdaConfiguration:
+    Description: "AchRtpDeadLetterLambdaConfiguration."
+    Type: String
+    Default: "2048:0:0:0:0:0.7:INFO"
+  LogRetentionDays:
+    Type: Number
+    Description: "Indica los dias de retencion de la data del log."
+    Default: 1
+  Timeout:
+    Type: Number
+    Description: "Indica el tiempo de espera de las lambdas."
+    Default: 300
+  RetryAttempts:
+    Type: Number
+    Description: "Indica el numero de reintentos maximo del EventBRidge."
+    Default: 1    
+
+  Timezone:
+    Description: Timezone
+    Type: String
+  LambdaAliasProduction:
+    Type: String
+    Description: 'Environment alias.'
+  SecretArn:
+    Type: String
+    Description: 'ARN del secreto que contiene los datos de conexion a la base de datos MySQL para el microservicio.'
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: 'Identificador del security group donde se ejecutará la lógica de negocio del microservicio.'
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: "Identificador de las subnets donde se desplegará el API de desarrollo (Deben estar entre comillas dobles y separadas por comas)."
+
+Conditions:
+  EventBridgeIsEnabled: !Equals [!Ref EventBridgeEnabled, "true"]
+  
+  AchRtpRetriesProvisioned: !Not [ !Equals [ !Select [ 4, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ], 0 ] ]
+  AchRtpRetriesActivateAutoscaling: !And
+    - !Not [ !Equals [ !Select [ 2, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ], !Select [ 3, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ] ] ]
+    - !Condition AchRtpRetriesProvisioned
+
+
+  AchRtpDeadLetterProvisioned: !Not [ !Equals [ !Select [ 4, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ], 0 ] ]
+  AchRtpDeadLetterActivateAutoscaling: !And
+    - !Not [ !Equals [ !Select [ 2, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ], !Select [ 3, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ] ] ]
+    - !Condition AchRtpDeadLetterProvisioned
+
+Resources:
+#__________________________Auto Scaling Role________________________________________________________
+  AchRtpAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ lambda.amazonaws.com ] }
+            Action: [ 'sts:AssumeRole' ]
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentId}-policy_allows_autoscaling"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ 'lambda:PutProvisionedConcurrencyConfig','lambda:GetProvisionedConcurrencyConfig','cloudwatch:PutMetricAlarm' ]
+                Resource: 
+                  - !Sub "arn:aws:lambda:${AwsRegion}:${AwsAccountId}:function:${EnvironmentId}-AchRtpRetriesLambda"
+                  - !Sub "arn:aws:lambda:${AwsRegion}:${AwsAccountId}:function:${EnvironmentId}-AchRtpDeadLetterLambda"
+
+
+
+#__________________________Invocation Role________________________________________________________
+  AchRtpRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join
+        - "-"
+        - - !Ref EnvironmentId
+          - !Ref Module
+          - "role"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${EnvironmentId}-policy_allows_getsecretvalue"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretArn
+      Tags:
+        - Key: "ENVIRONMENT_ID"
+          Value: !Ref EnvironmentId
+
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+        - "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonRDSDataFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonSQSFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess"
+        
+#_______________________________RetryOrderLambda______________________________________________
+  AchRtpRetriesLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Join
+        - ""
+        - - !Ref EnvironmentId
+          - "-AchRtpRetries"
+      Handler: com.cobis.ach.retries.RetriesLambda::handleRequest
+      CodeUri: cobis-ach-rtp-retries/target/com-cobis-ach-retries-1.0-SNAPSHOT.jar
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds  
+      Architectures:
+        - x86_64
+      MemorySize: 512
+      Runtime: java11
+      Tracing: Active      
+      Role: !GetAtt "AchRtpRole.Arn"
+      Timeout: !Ref Timeout
+      MemorySize: !Select [ 0, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ]
+      AutoPublishAlias: !Ref LambdaAliasBeta
+      Environment:
+        Variables:
+          Module: !Ref Module
+
+  AchRtpRetriesAliasProduction:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Description: "Alias a lambda de version productiva"
+      FunctionName: !Ref AchRtpRetriesLambda
+      FunctionVersion: !Select [ 7, !Split [ ":", !Ref AchRtpRetriesLambda.Version ] ]
+      Name: !Ref LambdaAliasProduction
+      ProvisionedConcurrencyConfig:
+        !If
+        - AchRtpRetriesProvisioned
+        - ProvisionedConcurrentExecutions: !Select [ 4, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ]
+        - !Ref "AWS::NoValue"
+        
+  AchRtpRetriesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AchRtpRetriesLambda}
+      RetentionInDays: !Ref LogRetentionDays
+
+  AchRtpRetriesScalableTarget:
+    Condition: AchRtpRetriesActivateAutoscaling
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: "AchRtpRetriesAliasProduction"
+    Properties:
+      MaxCapacity: !Select [ 2, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ]
+      MinCapacity: !Select [ 3, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ]
+      ResourceId: !Join
+        - ""
+        - - "function:"
+          - !Ref AchRtpRetriesLambda
+          - ":"
+          - !Ref LambdaAliasProduction
+      RoleARN: !Sub "${AchRtpAutoScalingRole}"
+      ScalableDimension: lambda:function:ProvisionedConcurrency
+      ServiceNamespace: lambda
+      ScheduledActions:
+        - ScalableTargetAction:
+            MinCapacity: 2
+            MaxCapacity: 2
+          Schedule: !Join [ " ", !Split [ "_", !Select [ 8, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ] ] ]
+          #Schedule: 'cron(0 8 ? * 2-6 *)'  #escala a las 8 am
+          ScheduledActionName: scale-out
+          Timezone: !Ref Timezone
+        - ScalableTargetAction:
+            MinCapacity: 0
+            MaxCapacity: 0
+          Schedule:  !Join [ " ", !Split [ "_", !Select [ 9, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ] ] ]
+          #Schedule: 'cron(0 9 ? * 2-6 *)'    #escala hasta las 9 am
+          ScheduledActionName: scale-in
+          Timezone: !Ref Timezone
+      SuspendedState:
+        DynamicScalingInSuspended: true
+        DynamicScalingOutSuspended: true
+        ScheduledScalingSuspended: true
+
+
+  AchRtpRetriesScalingPolicy:
+    Condition: AchRtpRetriesActivateAutoscaling
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join
+        - ""
+        - - !Ref EnvironmentId
+          - "-AchRtpRetries"
+          - "AutoScalingPolicy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AchRtpRetriesScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
+        TargetValue: !Select [ 5, !Split [ ":", !Ref AchRtpRetriesLambdaConfiguration ] ]
+ 
+
+
+#_______________________________DeadLetterLambda______________________________________________
+  AchRtpDeadLetterLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Join
+        - ""
+        - - !Ref EnvironmentId
+          - "-AchRtpDeadLetter"
+      Handler: com.cobis.ach.retries.DeadLetterLambda::handleRequest
+      CodeUri: cobis-ach-rtp-retries/target/com-cobis-ach-retries-1.0-SNAPSHOT.jar
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds  
+      Architectures:
+        - x86_64
+      MemorySize: 512
+      Runtime: java11
+      Tracing: Active      
+      Role: !GetAtt "AchRtpRole.Arn"
+      Timeout: !Ref Timeout
+      MemorySize: !Select [ 0, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ]
+      AutoPublishAlias: !Ref LambdaAliasBeta
+      Environment:
+        Variables:
+          Module: !Ref Module
+
+  AchRtpDeadLetterAliasProduction:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Description: "Alias a lambda de version productiva"
+      FunctionName: !Ref AchRtpDeadLetterLambda
+      FunctionVersion: !Select [ 7, !Split [ ":", !Ref AchRtpDeadLetterLambda.Version ] ]
+      Name: !Ref LambdaAliasProduction
+      ProvisionedConcurrencyConfig:
+        !If
+        - AchRtpDeadLetterProvisioned
+        - ProvisionedConcurrentExecutions: !Select [ 4, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ]
+        - !Ref "AWS::NoValue"
+        
+  AchRtpDeadLetterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AchRtpDeadLetterLambda}
+      RetentionInDays: !Ref LogRetentionDays
+
+  AchRtpDeadLetterScalableTarget:
+    Condition: AchRtpDeadLetterActivateAutoscaling
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: "AchRtpDeadLetterAliasProduction"
+    Properties:
+      MaxCapacity: !Select [ 2, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ]
+      MinCapacity: !Select [ 3, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ]
+      ResourceId: !Join
+        - ""
+        - - "function:"
+          - !Ref AchRtpDeadLetterLambda
+          - ":"
+          - !Ref LambdaAliasProduction
+      RoleARN: !Sub "${AchRtpAutoScalingRole}"
+      ScalableDimension: lambda:function:ProvisionedConcurrency
+      ServiceNamespace: lambda
+      ScheduledActions:
+        - ScalableTargetAction:
+            MinCapacity: 2
+            MaxCapacity: 2
+          Schedule: !Join [ " ", !Split [ "_", !Select [ 8, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ] ] ]
+          #Schedule: 'cron(0 8 ? * 2-6 *)'  #escala a las 8 am
+          ScheduledActionName: scale-out
+          Timezone: !Ref Timezone
+        - ScalableTargetAction:
+            MinCapacity: 0
+            MaxCapacity: 0
+          Schedule:  !Join [ " ", !Split [ "_", !Select [ 9, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ] ] ]
+          #Schedule: 'cron(0 9 ? * 2-6 *)'    #escala hasta las 9 am
+          ScheduledActionName: scale-in
+          Timezone: !Ref Timezone
+      SuspendedState:
+        DynamicScalingInSuspended: true
+        DynamicScalingOutSuspended: true
+        ScheduledScalingSuspended: true
+
+
+  AchRtpDeadLetterScalingPolicy:
+    Condition: AchRtpDeadLetterActivateAutoscaling
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join
+        - ""
+        - - !Ref EnvironmentId
+          - "-AchRtpDeadLetter"
+          - "AutoScalingPolicy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AchRtpDeadLetterScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
+        TargetValue: !Select [ 5, !Split [ ":", !Ref AchRtpDeadLetterLambdaConfiguration ] ]
+ 
+
+
+
+#_______________________________AchRtpDeadLetterQueue______________________________________________
+  AchRtpDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:       
+      MessageRetentionPeriod: 86400
+      VisibilityTimeout: !Ref Timeout
+      QueueName: !Sub ${EnvironmentId}-${Module}-RetryQueue
+      RedriveAllowPolicy: {"redrivePermission":"allowAll"}
+
+  SampleSQSPolicy: 
+    Type: AWS::SQS::QueuePolicy
+    Properties: 
+      Queues: 
+        - !Ref AchRtpDeadLetterQueue
+      PolicyDocument: 
+        Statement: 
+          - 
+            Action: 
+              - "SQS:SendMessage" 
+              - "SQS:ReceiveMessage"
+            Effect: "Allow"
+            Resource: "*"
+            Principal:  
+              AWS: 
+                - "681989517074"        
+#__________________________Rule Role________________________________________________________      
+  LambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt AchRtpDeadLetterQueue.Arn
+      FunctionName: !GetAtt AchRtpDeadLetterLambda.Arn
+#__________________________Rule Role________________________________________________________
+
+  # AchRtpRuleRole:
+  #   Type: "AWS::IAM::Role"
+  #   Properties:
+  #     RoleName: !Join
+  #       - "-"
+  #       - - !Ref EnvironmentId
+  #         - !Ref Module
+  #         - "rule"
+  #         - "role"
+  #     AssumeRolePolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - lambda.amazonaws.com
+  #           Action:
+  #             - "sts:AssumeRole"
+  #     Path: /
+  #     Policies:
+  #       - PolicyName: !Sub "${EnvironmentId}-policy_allows_getsecretvalue"
+  #         PolicyDocument:
+  #           Version: '2012-10-17'
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - secretsmanager:GetSecretValue
+  #               Resource:
+  #                 - !Ref SecretArn
+  #     Tags:
+  #       - Key: "ENVIRONMENT_ID"
+  #         Value: !Ref EnvironmentId
+
+  #     ManagedPolicyArns:
+  #       - arn:aws:iam::aws:policy/AdministratorAccess
+
+
+#_______________________________AchRtpRetrySendOrderRule______________________________________________
+  AchRtpRetrySendOrderRule:
+    Type: AWS::Events::Rule
+    Condition: EventBridgeIsEnabled
+    Properties: 
+      Description: Execute send order
+      EventBusName: default
+      Name: !Sub ${EnvironmentId}-${Module}-RetrySendOrder
+      EventPattern: 
+        source:
+          - ach.order.retry
+      State: !If [EventBridgeIsEnabled, ENABLED, DISABLED]
+      Targets: 
+        - Arn: !Sub arn:aws:lambda:${AwsRegion}:${AwsAccountId}:function:dev1-AchRtpRetries
+          Id: 'LambdaFunctionRetries'
+          #RoleArn: !GetAtt AchRtpRuleRole.Arn 
+          RetryPolicy:
+            MaximumRetryAttempts: !Ref RetryAttempts
+            MaximumEventAgeInSeconds: !Ref Timeout        
+          DeadLetterConfig:
+              Arn: !Sub arn:aws:sqs:${AwsRegion}:${AwsAccountId}:${EnvironmentId}-${Module}-RetryQueue
+
+#_______________________________EventBridgeLambdaPermission______________________________________________  
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: AchRtpRetriesLambda
+    Properties:
+      FunctionName: !GetAtt AchRtpRetriesLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AchRtpRetrySendOrderRule.Arn
+
+#_______________________________DeadLetterLambdaPermission______________________________________________  
+  DeadLetterLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: AchRtpDeadLetterLambda
+    Properties:
+      FunctionName: !GetAtt AchRtpDeadLetterLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AchRtpDeadLetterQueue.Arn
+
+
+  AchRtpRetriesAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      DestinationConfig:
+          OnFailure:
+            Destination: !GetAtt AchRtpDeadLetterQueue.Arn
+      FunctionName: !Ref AchRtpRetriesLambda
+      MaximumEventAgeInSeconds: !Ref Timeout
+      MaximumRetryAttempts: 2
+      Qualifier: !Ref LambdaAliasProduction
